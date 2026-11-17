@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>UAV Detect 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e9ebee; }
+  #map { position: absolute; inset: 0; }
+  #attr { position: absolute; right: 4px; bottom: 4px; padding: 1px 5px; border-radius: 3px;
+          font: 11px system-ui, -apple-system, Roboto, sans-serif; color: #333;
+          background: rgba(255, 255, 255, .8); pointer-events: none; }
+</style>
+<!-- deck.gl 9.4.1 (MIT, see DECKGL_LICENSE.txt). Inlined on phones. -->
+<script src="deck.min.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<div id="attr">© OpenStreetMap contributors</div>
+<script>
+'use strict';
+// The 3D view of UAV Detect. A tilted, flat OpenStreetMap plane with each
+// drone drawn at its real height: the path in the air, a see-through curtain
+// down to the ground, the drone and its label floating at altitude, and the
+// pilot on the ground. The app drives it with JSON messages:
+//   {type:'live', tracks:[...], me:[lon,lat]|null}  live scene
+//   {type:'flight', track:{...}}                       a recorded flight
+//   {type:'time', idx, pos:[lon,lat,h], pilot}         replay playhead
+//   {type:'fit'} / {type:'focus', pos:[lon,lat]}       camera
+//   {type:'follow', on}                                 chase the playhead
+// and hears back {type:'ready'}, {type:'select', id} and
+// {type:'follow', on:false} when a drag ends following.
+// Heights are metres above take-off; coordinates are [lon, lat, h].
+const {Deck, MapView, TileLayer, BitmapLayer, PathLayer, LineLayer, IconLayer,
+       TextLayer, ScatterplotLayer, SolidPolygonLayer, WebMercatorViewport,
+       FlyToInterpolator} = deck;
+
+const PITCH = 55, BEARING = -20;
+let live = null;        // last live scene
+let flight = null;      // recorded flight {color, name, points, pilot}
+let head = null;        // replay playhead {idx, pos, pilot}
+let current = {longitude: -73.97, latitude: 40.70, zoom: 11, pitch: PITCH,
+               bearing: BEARING, maxPitch: 75};
+let fitted = false;
+let follow = false;
+let followSettles = 0;  // until then, let the zoom-in animation run
+
+// On the web the page runs in an iframe; `frame` tells the app which one.
+const FRAME = new URLSearchParams(location.search).get('frame') || '';
+
+function post(message) {
+  const text = JSON.stringify(Object.assign({frame: FRAME}, message));
+  if (window.UavBridge) window.UavBridge.postMessage(text);
+  else if (window.parent !== window) window.parent.postMessage(text, '*');
+}
+
+const quad = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+  "<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'>" +
+  "<g fill='white'><circle cx='5.5' cy='5.5' r='3.6'/><circle cx='18.5' cy='5.5' r='3.6'/>" +
+  "<circle cx='5.5' cy='18.5' r='3.6'/><circle cx='18.5' cy='18.5' r='3.6'/>" +
+  "<rect x='8.6' y='8.6' width='6.8' height='6.8' rx='1.8'/></g>" +
+  "<path d='M6 6L18 18M18 6L6 18' stroke='white' stroke-width='2.4'/></svg>");
+const person = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+  "<svg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'>" +
+  "<path fill='white' d='M12 2C8.14 2 5 5.14 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.86-3.14-7-7-7zm0 2c1.1 0 2 .9 2 2 0 1.11-.9 2-2 2s-2-.89-2-2c0-1.1.9-2 2-2zm0 10c-1.67 0-3.14-.85-4-2.15.02-1.32 2.67-2.05 4-2.05s3.98.73 4 2.05c-.86 1.3-2.33 2.15-4 2.15z'/></svg>");
+const QUAD = {url: quad, width: 48, height: 48, mask: true, id: 'quad'};
+const PERSON = {url: person, width: 48, height: 48, mask: true, id: 'person', anchorY: 44};
+
+const deckgl = new Deck({
+  parent: document.getElementById('map'),
+  views: new MapView({repeat: false}),
+  initialViewState: current,
+  controller: {dragRotate: true, touchRotate: true, inertia: 300},
+  onViewStateChange: ({viewState}) => { current = viewState; },
+  onInteractionStateChange: ({isPanning}) => {
+    if (isPanning && follow) {
+      follow = false;
+      post({type: 'follow', on: false});
+    }
+  },
+  getCursor: ({isHovering, isDragging}) =>
+    isDragging ? 'grabbing' : isHovering ? 'pointer' : 'grab',
+  onClick: (info) => {
+    if (info.object && info.object.id) post({type: 'select', id: info.object.id});
+  },
+  layers: [],
+});
+
+function basemap() {
+  return new TileLayer({
+    id: 'osm',
+    data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    minZoom: 0, maxZoom: 19, tileSize: 256, maxRequests: 6,
+    refinementStrategy: 'best-available',
+    renderSubLayers: (props) => {
+      const {west, south, east, north} = props.tile.bbox;
+      return new BitmapLayer(props, {
+        data: null, image: props.data, bounds: [west, south, east, north],
+        desaturate: 1,
+      });
+    },
+  });
+}
+
+// A thin vertical wall under each path segment: the "curtain" that shows
+// how high the drone was. Segments are 1.2 m wide extruded quads.
+function curtain(path) {
+  const walls = [];
+  const step = Math.max(1, Math.floor(path.length / 400));
+  for (let i = step; i < path.length; i += step) {
+    const a = path[i - step], b = path[i];
+    const h = (a[2] + b[2]) / 2;
+    if (!(h > 0.5)) continue;
+    const mLat = 111320, mLon = 111320 * Math.cos(a[1] * Math.PI / 180);
+    const dx = (b[0] - a[0]) * mLon, dy = (b[1] - a[1]) * mLat;
+    const len = Math.hypot(dx, dy);
+    if (len < 0.01) continue;
+    const ox = (-dy / len) * 0.6 / mLon, oy = (dx / len) * 0.6 / mLat;
+    walls.push({h, polygon: [[a[0] + ox, a[1] + oy], [b[0] + ox, b[1] + oy],
+                             [b[0] - ox, b[1] - oy], [a[0] - ox, a[1] - oy]]});
+  }
+  return walls;
+}
+
+const ground = (p) => [p[0], p[1], 0];
+const rgba = (c, a) => [c[0], c[1], c[2], a];
+const ON_TOP = {depthCompare: 'always'};
+
+// Layers for one drone. `played` and `ahead` split a replay at the playhead.
+function droneLayers(id, t) {
+  const c = t.color, fade = t.stale ? 110 : 255;
+  const all = t.path || [];
+  const played = t.played || all, ahead = t.ahead || [];
+  const layers = [
+    new PathLayer({
+      id: id + '-shadow', data: [{path: all.map(ground)}],
+      getPath: (d) => d.path, getColor: [40, 40, 40, 70], getWidth: 2,
+      widthUnits: 'pixels', jointRounded: true, capRounded: true,
+    }),
+    new SolidPolygonLayer({
+      id: id + '-curtain', data: curtain(played), extruded: true,
+      getPolygon: (d) => d.polygon, getElevation: (d) => d.h,
+      getFillColor: rgba(c, t.stale ? 30 : 55), material: false,
+      parameters: {depthWriteEnabled: false},
+    }),
+    new PathLayer({
+      id: id + '-ahead', data: [{path: ahead}], getPath: (d) => d.path,
+      getColor: rgba(c, 80), getWidth: 3, widthUnits: 'pixels',
+      billboard: true, jointRounded: true, capRounded: true,
+    }),
+    new PathLayer({
+      id: id + '-path', data: [{path: played}], getPath: (d) => d.path,
+      getColor: rgba(c, fade), getWidth: 4, widthUnits: 'pixels',
+      billboard: true, jointRounded: true, capRounded: true,
+    }),
+  ];
+  if (t.pilotPath && t.pilotPath.length > 1) {
+    layers.push(new PathLayer({
+      id: id + '-pilot-trail', data: [{path: t.pilotPath.map(ground)}],
+      getPath: (d) => d.path, getColor: rgba(c, 120), getWidth: 2,
+      widthUnits: 'pixels',
+    }));
+  }
+  const pos = t.pos;
+  if (pos) {
+    if (t.pilot) {
+      layers.push(new LineLayer({
+        id: id + '-pilot-line', data: [{from: ground(t.pilot), to: pos}],
+        getSourcePosition: (d) => d.from, getTargetPosition: (d) => d.to,
+        getColor: [30, 30, 30, 110], getWidth: 1.5, widthUnits: 'pixels',
+      }));
+    }
+    layers.push(
+      new LineLayer({
+        id: id + '-pole', data: [{from: ground(pos), to: pos}],
+        getSourcePosition: (d) => d.from, getTargetPosition: (d) => d.to,
+        getColor: rgba(c, 170), getWidth: 2, widthUnits: 'pixels',
+      }),
+      new ScatterplotLayer({
+        id: id + '-foot', data: [{p: ground(pos)}], getPosition: (d) => d.p,
+        getRadius: 4, radiusUnits: 'pixels', getFillColor: rgba(c, 140),
+      }),
+      new ScatterplotLayer({
+        id: id + '-halo', data: [{id: t.id, p: pos}], getPosition: (d) => d.p,
+        getRadius: 17, radiusUnits: 'pixels', billboard: true, pickable: !!t.id,
+        getFillColor: [255, 255, 255, t.stale ? 150 : 235], stroked: true,
+        getLineColor: rgba(c, fade), getLineWidth: 2, lineWidthUnits: 'pixels',
+        parameters: ON_TOP,
+      }),
+      new IconLayer({
+        id: id + '-drone', data: [{id: t.id, p: pos}], getPosition: (d) => d.p,
+        getIcon: () => QUAD, getSize: 24, getColor: rgba(c, fade),
+        pickable: !!t.id, parameters: ON_TOP,
+      }),
+    );
+    if (t.label) {
+      layers.push(new TextLayer({
+        id: id + '-label', data: [{id: t.id, p: pos, text: t.label}],
+        getPosition: (d) => d.p, getText: (d) => d.text, getSize: 13,
+        getPixelOffset: [0, -30], getColor: [20, 20, 20, t.stale ? 140 : 255],
+        background: true, getBackgroundColor: [255, 255, 255, 225],
+        backgroundPadding: [6, 3], fontWeight: 600, characterSet: 'auto',
+        fontFamily: 'system-ui, -apple-system, Roboto, sans-serif',
+        pickable: !!t.id, parameters: ON_TOP,
+      }));
+    }
+  }
+  if (t.pilot) {
+    layers.push(new IconLayer({
+      id: id + '-pilot', data: [{p: ground(t.pilot)}], getPosition: (d) => d.p,
+      getIcon: () => PERSON, getSize: 30, getColor: rgba(c, fade),
+      parameters: ON_TOP,
+    }));
+  }
+  return layers;
+}
+
+function meLayer(me) {
+  return new ScatterplotLayer({
+    id: 'me', data: [{p: [me[0], me[1], 0]}], getPosition: (d) => d.p,
+    getRadius: 7, radiusUnits: 'pixels', getFillColor: [25, 118, 210, 255],
+    stroked: true, getLineColor: [255, 255, 255, 255], getLineWidth: 3,
+    lineWidthUnits: 'pixels', parameters: ON_TOP,
+  });
+}
+
+function replayTrack() {
+  const points = flight.points.map((p) => [p[0], p[1], p[2]]);
+  if (!head) return {color: flight.color, label: flight.name, path: points,
+                     played: points.slice(0, 1), ahead: points,
+                     pos: points[0], pilot: flight.pilot0};
+  const played = points.slice(0, head.idx + 1).concat([head.pos]);
+  const ahead = [head.pos].concat(points.slice(head.idx + 1));
+  return {color: flight.color, label: head.label || flight.name, path: points,
+          played, ahead, pos: head.pos, pilot: head.pilot,
+          pilotPath: flight.pilotPath};
+}
+
+function render() {
+  const layers = [basemap()];
+  if (flight) {
+    layers.push(...droneLayers('flight', replayTrack()));
+  } else if (live) {
+    for (const t of live.tracks) layers.push(...droneLayers('t-' + t.id, t));
+    if (live.me) layers.push(meLayer(live.me));
+  }
+  deckgl.setProps({layers});
+}
+
+// Frames the drones, not their pilots: a pilot miles away would shrink the
+// flight to a dot. The line to the pilot still shows which way they are.
+function bounds() {
+  const pts = [];
+  if (flight) {
+    pts.push(...flight.points);
+  } else if (live) {
+    for (const t of live.tracks) if (t.pos) pts.push(t.pos);
+  }
+  if (!pts.length) return null;
+  let w = 180, s = 90, e = -180, n = -90;
+  for (const p of pts) {
+    w = Math.min(w, p[0]); e = Math.max(e, p[0]);
+    s = Math.min(s, p[1]); n = Math.max(n, p[1]);
+  }
+  return [[w, s], [e, n]];
+}
+
+function flyTo(view) {
+  current = Object.assign({}, current, view, {
+    transitionDuration: 900, transitionInterpolator: new FlyToInterpolator(),
+  });
+  deckgl.setProps({initialViewState: current});
+}
+
+// Keeps the playhead centred, at the user's zoom, tilt and heading.
+function chase(pos, animate) {
+  current = Object.assign({}, current, {
+    longitude: pos[0], latitude: pos[1],
+    zoom: animate ? Math.max(current.zoom, 17) : current.zoom,
+    transitionDuration: animate ? 700 : 0,
+    transitionInterpolator: animate ? new FlyToInterpolator() : undefined,
+  });
+  deckgl.setProps({initialViewState: current});
+}
+
+function fit() {
+  follow = false;
+  const b = bounds();
+  if (!b) return;
+  const el = document.getElementById('map');
+  const width = el.clientWidth || 400, height = el.clientHeight || 400;
+  const pad = Math.min(80, Math.floor(Math.min(width, height) / 5));
+  let view;
+  if (b[0][0] === b[1][0] && b[0][1] === b[1][1]) {
+    view = {longitude: b[0][0], latitude: b[0][1], zoom: 16};
+  } else {
+    view = new WebMercatorViewport({width, height}).fitBounds(b, {padding: pad});
+  }
+  flyTo({longitude: view.longitude, latitude: view.latitude,
+         zoom: Math.min(17.5, view.zoom - 0.2), pitch: PITCH, bearing: BEARING});
+  fitted = true;
+}
+
+function handle(m) {
+  if (!m || typeof m !== 'object') return;
+  switch (m.type) {
+    case 'live':
+      live = m; flight = null;
+      render();
+      if (!fitted) fit();
+      break;
+    case 'flight':
+      flight = m.track; head = null; fitted = false;
+      render(); fit();
+      break;
+    case 'time':
+      head = m;
+      render();
+      if (follow && m.pos && Date.now() > followSettles) chase(m.pos, false);
+      break;
+    case 'follow':
+      follow = !!m.on;
+      if (follow && head && head.pos) {
+        followSettles = Date.now() + 750;
+        chase(head.pos, true);
+      }
+      break;
+    case 'fit':
+      fit();
+      break;
+    case 'focus':
+      flyTo({longitude: m.pos[0], latitude: m.pos[1], zoom: 16});
+      break;
+  }
+}
+
+window.uavMessage = handle;
+window.addEventListener('message', (e) => {
+  try { handle(typeof e.data === 'string' ? JSON.parse(e.data) : e.data); }
+  catch (err) { /* not for us */ }
+});
+render();
+post({type: 'ready'});
+</script>
+</body>
+</html>
